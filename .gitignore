@@ -1,0 +1,11 @@
+# Ignore image data folder completely
+data/
+
+# Ignore heavy 3D reconstruction files
+*.ply
+*.pcd
+*.obj
+
+# Ignore Python cache and environment files
+__pycache__/
+.env
