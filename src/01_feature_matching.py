@@ -16,7 +16,12 @@ def extract_features(image):
         keypoints (tuple): Detected OpenCV KeyPoint objects.
         descriptors (numpy.ndarray): Feature descriptors matrix (e.g. SIFT vectors).
     """
-    pass
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    sift = cv2.SIFT_create()  #[cite: 1]
+    keypoints, descriptors = sift.detectAndCompute(
+        gray, None
+    )  # Extract keypoints and descriptors[cite: 1]
+    return keypoints, descriptors
 
 
 def match_features(descriptors1, descriptors2):
@@ -30,7 +35,13 @@ def match_features(descriptors1, descriptors2):
     Returns:
         matches (list): List of match objects (e.g., DMatch objects or knn pairs).
     """
-    pass
+    # NORM_L2 is the standard Euclidean distance used for SIFT float vectors
+    bf = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
+    
+    # k=2 returns the 2 closest matches for each descriptor
+    matches = bf.knnMatch(descriptors1, descriptors2, k=2) 
+    
+    return matches
 
 
 def filter_matches_lowe(matches, ratio=0.75):
@@ -44,7 +55,15 @@ def filter_matches_lowe(matches, ratio=0.75):
     Returns:
         good_matches (list): Filtered list of robust match objects.
     """
-    pass
+    good_matches = []
+    
+    # matches is a list of tuples containing the 2 nearest neighbors (m, n) for each point
+    for m, n in matches:
+        # m is the nearest neighbor; n is the second-nearest
+        if m.distance < ratio * n.distance:
+            good_matches.append(m)  #
+            
+    return good_matches
 
 
 def draw_and_save_matches(img1, kp1, img2, kp2, matches, output_path):
@@ -59,7 +78,17 @@ def draw_and_save_matches(img1, kp1, img2, kp2, matches, output_path):
         matches (list): Filtered matches to draw.
         output_path (Path or str): Path where output image should be saved.
     """
-    pass
+    match_img = cv2.drawMatches(
+        img1, kp1, img2, kp2, matches, None, 
+        flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
+    )  #
+    
+    # Safely create the parent directories if they don't exist yet
+    out_dir = Path(output_path).parent
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save the final stitched image to disk
+    cv2.imwrite(str(output_path), match_img)  #
 
 
 def main():
@@ -70,7 +99,22 @@ def main():
     3. Run feature extraction, matching, and filtering.
     4. Save visualization results.
     """
-    pass
+    dataset = ImageDataset("data")
+    
+   
+    img0 = dataset[0]
+    img1 = dataset[1]
+    
+    kp1, descriptor1 = extract_features(img0) 
+    kp2, descriptor2 = extract_features(img1) 
+    
+    matches = match_features(descriptor1, descriptor2) 
+    good_matches = filter_matches_lowe(matches)  
+
+    output_path = "notebooks/outputs/feature_matches.png" 
+    draw_and_save_matches(img0, kp1, img1, kp2, good_matches, output_path) 
+    
+    print(f"Successfully filtered down to {len(good_matches)} robust matches.")
 
 
 if __name__ == "__main__":
