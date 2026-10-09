@@ -52,12 +52,12 @@ class ImageDataset:
                 f"Index {idx} out of range for dataset with length {len(self.image_paths)}."
             )
 
-        path = str(self.image_paths[idx])  # Safe to access now
-        img = cv2.imread(path)  #[cite: 1]
+        path = str(self.image_paths[idx])  
+        img = cv2.imread(path)
 
-        if img is None:  #[cite: 1]
+        if img is None:
             raise FileNotFoundError(
                 f"Could not read image at {path}"
-            )  #[cite: 1]
+            )  
 
-        return img  #[cite: 1]
+        return img  
