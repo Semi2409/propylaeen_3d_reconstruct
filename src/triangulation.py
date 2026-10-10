@@ -47,7 +47,23 @@ class Triangulator:
 
         # 2. Dehomogenize: divide (X, Y, Z) by W
         pts3D = pts4D[:, :3] / pts4D[:, 3:]
+        return pts3D
 
     def filter_cheirality(self, pts3D: np.ndarray, R: np.ndarray, T: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Filters points behind the camera (Z <= 0)."""
-        pass
+        """
+        Filters 3D points to keep only those in front of both cameras (Z > 0).
+        """
+        # Ensure T is a column vector (3, 1)
+        T = T.reshape(3, 1)
+
+        # Depth in Camera 1 frame (Z-coordinate)
+        depth1 = pts3D[:, 2]
+
+        # Transform points to Camera 2 frame: X2 = R @ X1 + T
+        pts3D_cam2 = (R @ pts3D.T + T).T
+        depth2 = pts3D_cam2[:, 2]
+
+        # Both depths must be strictly positive (> 0)
+        valid_mask = (depth1 > 0) & (depth2 > 0)
+        valid_pts3D = pts3D[valid_mask]
+        return valid_pts3D, valid_mask
