@@ -1,13 +1,12 @@
 import cv2
 import numpy as np
 from dataset import ImageDataset
-from feature_matching import extract_features, match_features, filter_matches_lowe
 
 class PoseEstimator:
     def __init__(self, K):
         """Store the intrinsic matrix as internal state."""
         self.K = K
-    def extract_match_coordinates(kp1, kp2, matches):
+    def extract_match_coordinates(self, kp1, kp2, matches):
         """
         Extract the (x, y) pixel coordinates from the filtered DMatch objects.
         
@@ -29,7 +28,7 @@ class PoseEstimator:
         # Returns two aligned numpy arrays of shape (N, 2)
         return pts1, pts2
 
-    def estimate_essential_matrix(self, pts1, pts2, K):
+    def estimate_essential_matrix(self, pts1, pts2):
         """
         Compute the Essential Matrix using the 5-point algorithm and RANSAC
         
@@ -45,7 +44,7 @@ class PoseEstimator:
         E, mask = cv2.findEssentialMat(
             pts1, 
             pts2, 
-            K, 
+            self.K, 
             method=cv2.RANSAC, 
             prob=0.999,    # 99.9% confidence that we find a pure inlier set
             threshold=1.0  # Epipolar distance threshold in pixels to be considered an inlier
