@@ -24,7 +24,7 @@ def get_image_paths(data_dir: Path = DATA_DIR) -> list[Path]:
     """
     gathers all files that end on given extension and sorts them numerically
     """
-    extensions = ("*.jpg", "*.jpeg", "*.png")
+    extensions = (".jpg", ".jpeg", ".png")
     paths = []
     for item in data_dir.iterdir():
         # check for file existence and valid image extension

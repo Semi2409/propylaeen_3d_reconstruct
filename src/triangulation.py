@@ -23,8 +23,8 @@ class Triangulator:
             P1 (np.ndarray): 3x4 projection matrix for Camera 1.
             P2 (np.ndarray): 3x4 projection matrix for Camera 2.
         """
-        P1 = self.K @ np.hstack((np.eye(3)), np.zeros(3, 1))
-        P2 = self.K @ np.hstack(R, T.reshape(3, 1))
+        P1 = self.K @ np.hstack((np.eye(3), np.zeros((3, 1))))
+        P2 = self.K @ np.hstack((R, T.reshape(3, 1)))
         return P1, P2
     
     def triangulate_points(self, P1: np.ndarray, P2: np.ndarray, pts1: np.ndarray, pts2: np.ndarray) -> np.ndarray:

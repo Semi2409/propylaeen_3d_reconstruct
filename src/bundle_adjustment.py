@@ -42,7 +42,7 @@ class BundleAdjuster:
 
         return pnt2D_pixel.T  # Returns shape (N, 2)
 
-    def compute_reprojection_residuals(self, R: np.ndarray, T: np.ndarray, pts3D: np.ndarray, pts1_2d: np.ndarray, pts2_2d: np.ndarray,
+    def compute_reprojection_residuals(self, params: np.ndarray, n_points: int, pts1_2d: np.ndarray, pts2_2d: np.ndarray,
     ) -> np.ndarray:
         """
         Computes the 1D vector of 2D pixel reprojection errors across both camera views[cite: 8].
@@ -57,8 +57,13 @@ class BundleAdjuster:
         Returns:
             residuals (np.ndarray): 1D array of length 4 * N containing signed pixel errors[cite: 8, 13].
         """
-        # 1. Reshape translation vector to column matrix (3, 1)[cite: 2]
-        T = T.reshape(3, 1)
+        # 1. UNFLATTEN 1D vector into structured geometric parameters
+        rvec = params[0:3]                         # 3D rotation vector (so3)
+        T = params[3:6].reshape(3, 1)             # 3x1 translation vector
+        pts3D = params[6:].reshape(n_points, 3)    # N x 3 point cloud coordinates
+
+        # 2. Reconstruct rotation matrix R from rvec
+        R, _ = cv2.Rodrigues(rvec)
 
         # 2. View 1 Projection: Camera 1 is at origin (R = Eye, T = 0)[cite: 2]
         pts1_proj = self._project_point(pts3D, np.eye(3), np.zeros((3, 1)))
@@ -111,5 +116,6 @@ class BundleAdjuster:
         R_opt, _ = cv2.Rodrigues(rvec_opt)
         T_opt = result.x[3:6].reshape(3, 1)
         pts3D_opt = result.x[6:].reshape(n_points, 3)
+        opt_rmse = np.sqrt(np.mean(result.fun**2))
 
-        return pts3D_opt, R_opt, T_opt
+        return pts3D_opt, R_opt, T_opt, opt_rmse
