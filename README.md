@@ -1,9 +1,11 @@
 # Incremental SFM and Dense Mesh Reconstruction of the Propyläen
 I present a fun little project on incremental SFM and dense mesh 3D reconstruction of the Propyläen building in Munich. The main target was to implement functions I learned in a lecture. If you don't have any experience in 3DCV I highly recommend you watching the lecture of Prof. Dr. Daniel Cremers on youtube. If there is some background I highly recommend reading following paper:
 
-Distinctive Image Features from Scale-Invariant Keypoints (D. G. Lowe), 2004 //
-An Efficient Solution to the Five-Point Relative Pose Problem (D. Nistér), 2004 //
+```text
+Distinctive Image Features from Scale-Invariant Keypoints (D. G. Lowe), 2004
+An Efficient Solution to the Five-Point Relative Pose Problem (D. Nistér), 2004 
 Screened Poisson Surface Reconstruction (M. Kazhdan, H. Hoppe), 2013
+```
 
 ## Dependencies
 I support Ubuntu, but it might work on a variety of other platforms that meet the dependency requirements.
