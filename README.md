@@ -27,27 +27,23 @@ pip install opencv-python opencv-contrib-python numpy scipy matplotlib open3d
 
 ## Project Structure
 ```text
-propyläen_3d_reconstruct/
-├── .vscode/
-├── data/
-├── notebooks/
+propylaeen_3d_reconstruct/
+├── data/               # Raw image dataset (Ignored by Git)
+├── notebooks/          # Interactive experimentation & visualization
 │   ├── incremental_sfm.ipynb
 │   ├── reconstruction_analysis.ipynb
 │   └── surface_meshing.ipynb
-├── outputs/
-│   ├── building_mesh.ply
-│   ├── final_reconstruction.ply
-│   └── incremental_building_reconstruction.ply
-├── src/
-│   ├── bundle_adjustment.py
-│   ├── dataset.py
-│   ├── feature_matching.py
-│   ├── main.py
-│   ├── pose_estimation.py
-│   ├── triangulation.py
-│   └── utils.py
-├── .gitignore
-└── README.md
+├── outputs/            # Generated .ply point clouds and meshes (Ignored by Git)
+├── src/                # Core modular Python engine
+│   ├── dataset.py            # Image loading & dataset handling
+│   ├── feature_matching.py   # SIFT extraction & Lowe's ratio test matching
+│   ├── pose_estimation.py    # Essential matrix & 5-point algorithm relative pose
+│   ├── triangulation.py      # DLT triangulation & cheirality filtering
+│   ├── optimization.py       # Non-linear Bundle Adjustment optimization
+│   ├── utils.py              # Intrinsic matrix K generation & PLY export helpers
+│   └── main.py               # Pipeline orchestrator
+├── .gitignore          # Git exclusion rules for large data/outputs
+└── README.md           # Project documentation
 ```
 
 ## Usage
