@@ -9,7 +9,7 @@ import torch
 
 class FeatureMatcher:
     def __init__(self, ratio_threshold=0.75, device = "cuda"):
-        self.detector = cv2.SIFT_create() #[cite: 5]
+        self.detector = cv2.SIFT_create()
         self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
         self.ratio = ratio_threshold
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
@@ -95,29 +95,6 @@ class FeatureMatcher:
             good_matches.append(m)
 
         return good_matches
-
-
-    def filter_matches_lowe(self, matches):
-        """
-        Apply Lowe's Ratio Test to eliminate ambiguous or weak matches.
-        
-        Parameters:
-            matches (list): Raw k-NN matches from matcher.
-            ratio (float): Lowe's threshold factor (typically 0.7 to 0.8).
-            
-        Returns:
-            good_matches (list): Filtered list of robust match objects.
-        """
-        good_matches = []
-        
-        # matches is a list of tuples containing the 2 nearest neighbors (m, n) for each point
-        for m, n in matches:
-            # m is the nearest neighbor; n is the second-nearest
-            if m.distance < self.ratio * n.distance:
-                good_matches.append(m)  #
-                
-        return good_matches
-
 
     def draw_and_save_matches(self, img1, kp1, img2, kp2, matches, output_path):
         """
