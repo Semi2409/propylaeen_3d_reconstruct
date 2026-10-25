@@ -1,121 +1,111 @@
-import numpy as np
 import cv2
-from scipy.optimize import least_squares
+import numpy as np
+import torch
+import torch.nn.functional as F
 
 class BundleAdjuster:
-    def __init__(self, K: np.ndarray, method: str = "lm"):
+    def __init__(self, K: np.ndarray, device="cuda"):
+        # Automatically target the GPU if available
+        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.K_np = K  # Keep a NumPy copy for the CPU residual check
+        self.K = torch.tensor(K, dtype=torch.float32, device=self.device)
+
+    def compute_reprojection_residuals(self, params: np.ndarray, n_points: int, pts1_2d: np.ndarray, pts2_2d: np.ndarray,) -> np.ndarray:
         """
-        Constructor stores intrinsic camera parameters and solver configuration.
-        
-        Parameters:
-            K (np.ndarray): 3x3 intrinsic camera matrix.
-            method (str): Optimization method ('lm' for Levenberg-Marquardt, 'trf' for Trust Region Reflective).
+        CPU-based residual computation strictly maintained so your main.py 
+        can calculate and print the 'Initial Reprojection RMSE' before optimization.
         """
-        self.K = K
-        self.method = method
+        rvec = params[0:3]
+        T = params[3:6].reshape(3, 1)
+        pts3D = params[6:].reshape(n_points, 3)
 
-    def _project_point(self, pnt3D: np.ndarray, R: np.ndarray, T: np.ndarray) -> np.ndarray:
-        """
-        Helper method: Applies perspective division pi(R * X + T) using K.
-        
-        Parameters:
-            point3D (np.ndarray): (3,) or (N, 3) 3D coordinate(s).
-            R (np.ndarray): 3x3 rotation matrix.
-            T (np.ndarray): 3x1 translation vector.
-            
-        Returns:
-            uv (np.ndarray): (2,) or (N, 2) projected 2D pixel coordinates.
-        """
-        T = T.reshape(3, 1)
-
-        # Step 1: Transform points to Camera 2 coordinates (3, N)
-        pnt3D_cam = R @ pnt3D.T + T  # Shape: (3, N)
-
-        # Step 2: Perspective division by depth Z_c (Row index 2)
-        pnt2D_normalized = pnt3D_cam[:2, :] / pnt3D_cam[2:, :]  # Shape: (2, N)
-
-        # Step 3: Map to pixel space using intrinsics K (2x2 focal scale + offset)
-        focal = np.array([[self.K[0, 0]], [self.K[1, 1]]])  # [[fx], [fy]]
-        principal_point = np.array([[self.K[0, 2]], [self.K[1, 2]]])  # [[cx], [cy]]
-
-        pnt2D_pixel = (pnt2D_normalized * focal) + principal_point  # Shape: (2, N)
-
-        return pnt2D_pixel.T  # Returns shape (N, 2)
-
-    def compute_reprojection_residuals(self, params: np.ndarray, n_points: int, pts1_2d: np.ndarray, pts2_2d: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Computes the 1D vector of 2D pixel reprojection errors across both camera views[cite: 8].
-
-        Parameters:
-            R (np.ndarray): 3x3 rotation matrix for Camera 2[cite: 2].
-            T (np.ndarray): 3x1 (or 3,) translation vector for Camera 2[cite: 2].
-            pts3D (np.ndarray): (N, 3) Euclidean 3D coordinates[cite: 13].
-            pts1_2d (np.ndarray): (N, 2) measured 2D keypoints in Image 1[cite: 8].
-            pts2_2d (np.ndarray): (N, 2) measured 2D keypoints in Image 2[cite: 8].
-
-        Returns:
-            residuals (np.ndarray): 1D array of length 4 * N containing signed pixel errors[cite: 8, 13].
-        """
-        # 1. UNFLATTEN 1D vector into structured geometric parameters
-        rvec = params[0:3]                         # 3D rotation vector (so3)
-        T = params[3:6].reshape(3, 1)             # 3x1 translation vector
-        pts3D = params[6:].reshape(n_points, 3)    # N x 3 point cloud coordinates
-
-        # 2. Reconstruct rotation matrix R from rvec
         R, _ = cv2.Rodrigues(rvec)
 
-        # 2. View 1 Projection: Camera 1 is at origin (R = Eye, T = 0)[cite: 2]
-        pts1_proj = self._project_point(pts3D, np.eye(3), np.zeros((3, 1)))
+        # Camera 1 projection (origin: P1 = K [I | 0])
+        proj1 = (self.K_np @ pts3D.T).T
+        pts1_proj = proj1[:, :2] / proj1[:, 2:]
 
-        # 3. View 2 Projection: Camera 2 uses provided (R, T)[cite: 2]
-        pts2_proj = self._project_point(pts3D, R, T)
+        # Camera 2 projection (P2 = K [R | T])
+        proj2 = (self.K_np @ (R @ pts3D.T + T)).T
+        pts2_proj = proj2[:, :2] / proj2[:, 2:]
 
-        # 4. Calculate signed 2D pixel differences (Measured - Projected)[cite: 8, 13]
-        err1 = (pts1_2d - pts1_proj).ravel()  # Length: 2 * N
-        err2 = (pts2_2d - pts2_proj).ravel()  # Length: 2 * N
+        # Calculate pixel residuals
+        res1 = (pts1_proj - pts1_2d).ravel()
+        res2 = (pts2_proj - pts2_2d).ravel()
 
-        # 5. Concatenate into a single flat residual vector[cite: 8, 13]
-        return np.concatenate([err1, err2])
+        return np.hstack([res1, res2])
 
-    def optimize_2view(self, pts3D_init: np.ndarray, R_init: np.ndarray, T_init: np.ndarray, 
-                       pts1_2d: np.ndarray, pts2_2d: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    def optimize_2view(self, pts3D_init: np.ndarray, R_init: np.ndarray, T_init: np.ndarray, pts1_2d: np.ndarray, pts2_2d: np.ndarray, max_iter: int = 100):
         """
-        Runs the iterative non-linear solver (Gauss-Newton / Levenberg-Marquardt) 
-        to refine point cloud coordinates and relative camera pose.
+        Executes non-linear optimization natively on the GPU using PyTorch Autograd.
+        Replaces scipy.optimize.least_squares.
+        """
+        # 1. Convert NumPy arrays to GPU Tensors and enable gradient tracking
+        pts3D = torch.tensor(pts3D_init, dtype=torch.float32, device=self.device, requires_grad=True)
         
-        Parameters:
-            pts3D_init (np.ndarray): (N, 3) initial triangulated points (X_0 from DLT/SVD).
-            R_init (np.ndarray): 3x3 initial rotation matrix.
-            T_init (np.ndarray): 3x1 initial translation vector.
-            pts1_2d (np.ndarray): (N, 2) measured 2D keypoints in Image 1.
-            pts2_2d (np.ndarray): (N, 2) measured 2D keypoints in Image 2.
-            
-        Returns:
-            pts3D_opt (np.ndarray): (N, 3) refined 3D coordinates.
-            R_opt (np.ndarray): 3x3 refined rotation matrix.
-            T_opt (np.ndarray): 3x1 refined translation vector.
-            final_rmse (float): Final Root Mean Square Error in pixels.
-        """
-        n_points = len(pts3D_init)
         rvec_init, _ = cv2.Rodrigues(R_init)
+        rvec = torch.tensor(rvec_init.ravel(), dtype=torch.float32, device=self.device, requires_grad=True)
+        T = torch.tensor(T_init.ravel(), dtype=torch.float32, device=self.device, requires_grad=True)
 
-        # 1. FLATTEN
-        params_init = np.hstack([rvec_init.flatten(), T_init.flatten(), pts3D_init.flatten()])
+        pts1_t = torch.tensor(pts1_2d, dtype=torch.float32, device=self.device)
+        pts2_t = torch.tensor(pts2_2d, dtype=torch.float32, device=self.device)
 
-        # 2. RUN LEAST SQUARES SOLVER
-        result = least_squares(
-            fun=self.compute_reprojection_residuals,
-            x0=params_init,
-            args=(n_points, pts1_2d, pts2_2d),
-            method='lm'  # Levenberg-Marquardt
-        )
+        # 2. Initialize GPU Optimizer (L-BFGS handles smooth deterministic losses well)
+        optimizer = torch.optim.LBFGS([pts3D, rvec, T], max_iter=max_iter, line_search_fn="strong_wolfe")
 
-        # 3. UNFLATTEN back to clean, structured matrices
-        rvec_opt = result.x[0:3]
-        R_opt, _ = cv2.Rodrigues(rvec_opt)
-        T_opt = result.x[3:6].reshape(3, 1)
-        pts3D_opt = result.x[6:].reshape(n_points, 3)
-        opt_rmse = np.sqrt(np.mean(result.fun**2))
+        def closure():
+            optimizer.zero_grad()
+            
+            # Camera 1 Reprojection 
+            proj1 = pts3D @ self.K.T
+            proj1 = proj1[:, :2] / proj1[:, 2:]
+            
+            # Camera 2 Reprojection (GPU Rodrigues Conversion)
+            theta = torch.norm(rvec)
+            if theta > 1e-6:
+                r = rvec / theta
+                K_mat = torch.zeros((3, 3), device=self.device)
+                K_mat[0, 1] = -r[2]; K_mat[0, 2] = r[1]
+                K_mat[1, 0] = r[2];  K_mat[1, 2] = -r[0]
+                K_mat[2, 0] = -r[1]; K_mat[2, 1] = r[0]
+                R = torch.eye(3, device=self.device) + torch.sin(theta)*K_mat + (1-torch.cos(theta))*(K_mat@K_mat)
+            else:
+                R = torch.eye(3, device=self.device)
 
-        return pts3D_opt, R_opt, T_opt, opt_rmse
+            pts3D_cam2 = (R @ pts3D.T).T + T
+            proj2 = pts3D_cam2 @ self.K.T
+            proj2 = proj2[:, :2] / proj2[:, 2:]
+
+            # Compute Los
+            loss = F.mse_loss(proj1, pts1_t) + F.mse_loss(proj2, pts2_t)
+            loss.backward()
+            return loss
+
+        # 3. Execute Optimization Step on CUDA
+        optimizer.step(closure)
+
+        # 4. Extract optimized data back to CPU NumPy arrays
+        with torch.no_grad():
+            # Compute final reprojection loss forward pass without backward()
+            proj1 = pts3D @ self.K.T
+            proj1 = proj1[:, :2] / proj1[:, 2:]
+            
+            theta = torch.norm(rvec)
+            if theta > 1e-6:
+                r = rvec / theta
+                K_mat = torch.zeros((3, 3), device=self.device)
+                K_mat[0, 1] = -r[2]; K_mat[0, 2] = r[1]
+                K_mat[1, 0] = r[2];  K_mat[1, 2] = -r[0]
+                K_mat[2, 0] = -r[1]; K_mat[2, 1] = r[0]
+                R_opt = torch.eye(3, device=self.device) + torch.sin(theta)*K_mat + (1-torch.cos(theta))*(K_mat@K_mat)
+            else:
+                R_opt = torch.eye(3, device=self.device)
+
+            pts3D_cam2 = (R_opt @ pts3D.T).T + T.view(3, 1).T
+            proj2 = pts3D_cam2 @ self.K.T
+            proj2 = proj2[:, :2] / proj2[:, 2:]
+
+            final_loss = F.mse_loss(proj1, pts1_t) + F.mse_loss(proj2, pts2_t)
+            opt_rmse = float(torch.sqrt(final_loss).item())
+
+            return pts3D.cpu().numpy(), R_opt.cpu().numpy(), T.cpu().numpy().reshape(3, 1), opt_rmse
