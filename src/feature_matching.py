@@ -1,19 +1,59 @@
 import cv2
 import numpy as np
-import os
 from pathlib import Path
 from dataset import ImageDataset
 import torch
-
+from ultralytics import YOLO
 
 
 class FeatureMatcher:
-    def __init__(self, ratio_threshold=0.75, device = "cuda"):
+    def __init__(self, ratio_threshold=0.75, device = "cuda", yolo_model="yolov8n-seg.pt"):
         self.detector = cv2.SIFT_create()
         self.matcher = cv2.BFMatcher(cv2.NORM_L2, crossCheck=False)
         self.ratio = ratio_threshold
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.yolo = YOLO(yolo_model)
+        # 2: car, 0: person, 5: bus, 7: truck, 9: traffic light, 11: stop sign (adjust as needed)
+        self.classes_to_remove = [0, 2, 5, 7, 9, 11]
 
+    def create_dynamic_mask(self, image):
+        """
+        Creates a binary mask where dynamic/unwanted objects (cars, poles, traffic lights)
+        and trees/foliage are blacked out (0), leaving only the static building/background (255).
+        """
+        h, w = image.shape[:2]
+        # Start with everything active (white = 255)
+        mask = np.ones((h, w), dtype=np.uint8) * 255
+
+        # 1. Mask dynamic hardware/cars/traffic lights using YOLO
+        results = self.yolo(image, verbose=False)
+        for result in results:
+            if result.masks is not None:
+                boxes = result.boxes.cpu().numpy()
+                masks = result.masks.cpu().numpy()
+                for box, seg_mask in zip(boxes, masks.data):
+                    if int(box.cls[0]) in self.classes_to_remove:
+                        resized_mask = cv2.resize(seg_mask, (w, h))
+                        mask[resized_mask > 0.5] = 0
+
+        # 2. Mask trees/vegetation using HSV + Morphological Cleanup
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        
+        # Broad HSV bounds for green leaves and yellowish foliage
+        lower_foliage = np.array([35, 70, 30])
+        upper_foliage = np.array([85, 255, 255])
+        
+        tree_mask = cv2.inRange(hsv, lower_foliage, upper_foliage)
+        
+        # Morphological Closing: fills small holes/gaps between leaves
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
+        tree_mask = cv2.morphologyEx(tree_mask, cv2.MORPH_CLOSE, kernel)
+        
+        # Apply tree mask to our master mask
+        mask[tree_mask > 0] = 0
+
+        return mask
+    
     def extract_features(self, image):
         """
         Detect keypoints and compute descriptors for a given image.
@@ -26,9 +66,10 @@ class FeatureMatcher:
             descriptors (numpy.ndarray): Feature descriptors matrix (e.g. SIFT vectors).
         """
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        mask = self.create_dynamic_mask(image)
         keypoints, descriptors = self.detector.detectAndCompute(
-            gray, None
-        )
+                    gray, mask
+                )
         return keypoints, descriptors
 
 
