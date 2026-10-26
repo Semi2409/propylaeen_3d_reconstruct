@@ -37,93 +37,124 @@ class BundleAdjuster:
 
         return np.hstack([res1, res2])
 
-    def optimize_local_window(self, registered_cameras: dict, track_graph, all_kp: dict, window_size: int = 5, max_iter: int = 30,):
-        """Runs Local Bundle Adjustment on a sliding window of the last N registered cameras
+    @staticmethod
+    def _rodrigues_batch(rvecs: torch.Tensor) -> torch.Tensor:
+        """Converts (N, 3) axis-angle vectors to (N, 3, 3) rotation matrices (differentiable)."""
+        theta = rvecs.norm(dim=1, keepdim=True).clamp_min(1e-8)
+        k = rvecs / theta
+        z = torch.zeros_like(k[:, 0])
+        Kx = torch.stack([z, -k[:, 2], k[:, 1],
+                          k[:, 2], z, -k[:, 0],
+                          -k[:, 1], k[:, 0], z], dim=1).view(-1, 3, 3)
+        s = torch.sin(theta)[..., None]
+        c = torch.cos(theta)[..., None]
+        I = torch.eye(3, dtype=rvecs.dtype, device=rvecs.device).expand_as(Kx)
+        return I + s * Kx + (1 - c) * (Kx @ Kx)
 
-        and all 3D landmarks visible to them. Updates registered_cameras and
-        track_graph in-place.
+    def _run_ba(self, registered_cameras: dict, track_graph, all_kp: dict, cam_ids: list, fixed_cam_ids: set,
+                max_iter: int, loss_scale: float, label: str):
         """
-        registered_ids = list(registered_cameras.keys())
-        if len(registered_ids) < 2:
-            return
+        Shared BA solver. Optimizes the poses of `cam_ids` (except `fixed_cam_ids`) and every 3D point
+        they observe, using a Huber loss with threshold `loss_scale` (pixels).
+        Updates registered_cameras and track_graph in place.
+        Returns (rmse_before, rmse_after) in pixels, or None if there was nothing to optimize.
+        """
+        cam_id_to_idx = {cid: idx for idx, cid in enumerate(cam_ids)}
 
-        # Select last N registered cameras for local window
-        window_cam_ids = set(registered_ids[-window_size:])
-        fixed_cam_id = registered_ids[-window_size]  # Gauge anchor camera
-
-        # 1. Collect all observations for cameras in the sliding window
-        obs_cam_ids = []
-        obs_p3d_ids = []
-        obs_uvs = []
-        window_p3d_ids = set()  # MUST BE A SET to use .add()
-
-        for (img_idx, kp_idx), p3d_id in track_graph.kp_to_point3D.items():
-            if img_idx in window_cam_ids and p3d_id in track_graph.global_points3D:
-                # Extract 2D pixel coordinate (u, v) from keypoints
-                uv = all_kp[img_idx][kp_idx].pt
-                obs_cam_ids.append(img_idx)
+        # 1. Collect observations of the selected cameras from the TrackGraph
+        obs_cam_ids, obs_p3d_ids, obs_uvs = [], [], []
+        p3d_ids = set()
+        for (cam_id, kp_idx), p3d_id in track_graph.kp_to_point3D.items():
+            if cam_id in cam_id_to_idx and p3d_id in track_graph.global_points3D:
+                obs_cam_ids.append(cam_id)
                 obs_p3d_ids.append(p3d_id)
-                obs_uvs.append(uv)
-                window_p3d_ids.add(p3d_id)  # Works correctly on set!
+                obs_uvs.append(all_kp[cam_id][kp_idx].pt)
+                p3d_ids.add(p3d_id)
 
-        window_p3d_ids = list(window_p3d_ids)
-        if len(window_p3d_ids) == 0 or len(obs_uvs) == 0:
-            return
+        if len(obs_uvs) == 0:
+            print(f"{label} skipped: No active observations found.")
+            return None
 
-        # 2. Map global IDs to continuous array indices for PyTorch
-        cam_id_to_idx = {cid: idx for idx, cid in enumerate(window_cam_ids)}
-        p3d_id_to_idx = {pid: idx for idx, pid in enumerate(window_p3d_ids)}
+        p3d_id_list = sorted(p3d_ids)
+        p3d_id_to_idx = {pid: idx for idx, pid in enumerate(p3d_id_list)}
 
-        # Initial 3D landmark array
-        pts3D_init = np.array(
-            [track_graph.global_points3D[pid] for pid in window_p3d_ids]
-        )
+        # 2. Initial parameters
+        pts3D_init = np.array([np.asarray(track_graph.global_points3D[pid]).ravel() for pid in p3d_id_list])
+        rvecs_init, Ts_init = [], []
+        for cid in cam_ids:
+            rvec, _ = cv2.Rodrigues(np.asarray(registered_cameras[cid]["R"], dtype=np.float64))
+            rvecs_init.append(rvec.ravel())
+            Ts_init.append(np.asarray(registered_cameras[cid]["T"]).ravel())
 
-        # Initial camera pose parameters (rvec, T)
-        cam_rvecs_init, cam_Ts_init = [], []
-        for cid in window_cam_ids:
-            R = registered_cameras[cid]["R"]
-            T = registered_cameras[cid]["T"]
-            rvec, _ = cv2.Rodrigues(R)
-            cam_rvecs_init.append(rvec.flatten())
-            cam_Ts_init.append(T.flatten())
+        # 3. Tensors
+        pts3D_t = torch.tensor(pts3D_init, dtype=torch.float32, device=self.device, requires_grad=True)
+        rvecs_t = torch.tensor(np.array(rvecs_init), dtype=torch.float32, device=self.device, requires_grad=True)
+        Ts_t = torch.tensor(np.array(Ts_init), dtype=torch.float32, device=self.device, requires_grad=True)
 
-        # 3. Create PyTorch Tensors
-        pts3D_t = torch.tensor(
-            pts3D_init, dtype=torch.float32, device=self.device, requires_grad=True
-        )
-        rvecs_t = torch.tensor(
-            np.array(cam_rvecs_init),
-            dtype=torch.float32,
-            device=self.device,
-            requires_grad=True,
-        )
-        Ts_t = torch.tensor(
-            np.array(cam_Ts_init),
-            dtype=torch.float32,
-            device=self.device,
-            requires_grad=True,
-        )
+        obs_c_idx = torch.tensor([cam_id_to_idx[c] for c in obs_cam_ids], dtype=torch.long, device=self.device)
+        obs_p_idx = torch.tensor([p3d_id_to_idx[p] for p in obs_p3d_ids], dtype=torch.long, device=self.device)
+        obs_uv_t = torch.tensor(np.array(obs_uvs), dtype=torch.float32, device=self.device)
 
-        # Convert observations to index tensors
-        obs_c_idx = torch.tensor(
-            [cam_id_to_idx[cid] for cid in obs_cam_ids],
-            dtype=torch.long,
-            device=self.device,
-        )
-        obs_p_idx = torch.tensor(
-            [p3d_id_to_idx[pid] for pid in obs_p3d_ids],
-            dtype=torch.long,
-            device=self.device,
-        )
-        obs_uv_t = torch.tensor(
-            np.array(obs_uvs), dtype=torch.float32, device=self.device
-        )
+        # Gauge anchor: these cameras get zero gradient, so L-BFGS never moves them
+        fixed_mask = torch.tensor([cid in fixed_cam_ids for cid in cam_ids], dtype=torch.bool, device=self.device)
 
-        # 4. Optimization via L-BFGS
-        optimizer = torch.optim.LBFGS(
-            [pts3D_t, rvecs_t, Ts_t], max_iter=max_iter, line_search_fn="strong_wolfe"
-        )
+        def project():
+            R = self._rodrigues_batch(rvecs_t)[obs_c_idx]                       # (M, 3, 3)
+            Xc = (R @ pts3D_t[obs_p_idx].unsqueeze(-1)).squeeze(-1) + Ts_t[obs_c_idx]
+            proj = Xc @ self.K.T
+            return proj[:, :2] / proj[:, 2:].clamp_min(1e-6)                    # (M, 2)
+
+        def rmse():
+            with torch.no_grad():
+                return float(torch.sqrt(((project() - obs_uv_t) ** 2).mean()).item())  # same convention as utils.compute_rmse
+
+        rmse_before = rmse()
+
+        # 4. Optimize with L-BFGS on a robust (Huber) reprojection loss
+        optimizer = torch.optim.LBFGS([pts3D_t, rvecs_t, Ts_t], max_iter=max_iter, line_search_fn="strong_wolfe")
+
+        def closure():
+            optimizer.zero_grad()
+            loss = F.huber_loss(project(), obs_uv_t, delta=loss_scale)
+            loss.backward()
+            rvecs_t.grad[fixed_mask] = 0
+            Ts_t.grad[fixed_mask] = 0
+            return loss
+
+        optimizer.step(closure)
+        rmse_after = rmse()
+
+        # 5. Write results back
+        rvecs_opt = rvecs_t.detach().cpu().numpy().astype(np.float64)
+        Ts_opt = Ts_t.detach().cpu().numpy().astype(np.float64)
+        pts_opt = pts3D_t.detach().cpu().numpy().astype(np.float64)
+        for cid, i in cam_id_to_idx.items():
+            if cid in fixed_cam_ids:
+                continue
+            registered_cameras[cid]["R"] = cv2.Rodrigues(rvecs_opt[i])[0]
+            registered_cameras[cid]["T"] = Ts_opt[i].reshape(3, 1)
+        for pid, i in p3d_id_to_idx.items():
+            track_graph.global_points3D[pid] = pts_opt[i]
+
+        print(f"{label}: {len(cam_ids)} cams | {len(p3d_id_list)} pts | {len(obs_uvs)} obs | "
+              f"RMSE {rmse_before:.3f} -> {rmse_after:.3f} px")
+        return rmse_before, rmse_after
+
+    def optimize_local_window(self, registered_cameras: dict, track_graph, all_kp: dict, window_size: int = 5,
+                              max_iter: int = 30, loss_scale: float = 2.0):
+        """
+        Runs Local Bundle Adjustment on a sliding window of the last N registered cameras
+        and all 3D landmarks visible to them. The oldest camera in the window is held fixed.
+        Updates registered_cameras and track_graph in-place.
+        """
+        registered_ids = list(registered_cameras.keys())  # insertion order = registration order
+        if len(registered_ids) < 2:
+            return None
+
+        window_cam_ids = registered_ids[-min(window_size, len(registered_ids)):]
+        fixed_cam_ids = {window_cam_ids[0]}
+        return self._run_ba(registered_cameras, track_graph, all_kp, window_cam_ids, fixed_cam_ids,
+                            max_iter, loss_scale, label="Local BA")
 
     def optimize_2view(self, pts3D_init: np.ndarray, R_init: np.ndarray, T_init: np.ndarray, pts1_2d: np.ndarray, pts2_2d: np.ndarray, max_iter: int = 100):
         """
@@ -196,7 +227,7 @@ class BundleAdjuster:
             proj2 = proj2[:, :2] / proj2[:, 2:]
 
             final_loss = F.mse_loss(proj1, pts1_t) + F.mse_loss(proj2, pts2_t)
-            opt_rmse = float(torch.sqrt(final_loss).item())
+            opt_rmse = float(torch.sqrt(final_loss / 2).item())  # mean over both views, same as utils.compute_rmse
 
             return pts3D.cpu().numpy(), R_opt.cpu().numpy(), T.cpu().numpy().reshape(3, 1), opt_rmse
 
@@ -206,68 +237,26 @@ class BundleAdjuster:
         registered_cameras: dict,
         track_graph,
         all_kp: dict,
-        max_iter: int = 50,
-        loss_scale: float = 1.0
+        max_iter: int = 200,
+        loss_scale: float = 1.0,
+        fixed_cam_id=None,
     ) -> tuple[dict, object]:
         """
-        Executes Global Bundle Adjustment natively on CUDA using PyTorch autograd + L-BFGS.
+        Executes Global Bundle Adjustment using PyTorch autograd + L-BFGS.
         Refines ALL registered camera poses and ALL 3D points simultaneously.
+
+        Parameters:
+            loss_scale (float): Huber threshold in pixels. Residuals larger than this are
+                                down-weighted (linear instead of quadratic), which limits outlier impact.
+            fixed_cam_id: Camera held fixed to anchor the gauge (default: lowest camera id).
         """
-        cam_ids = sorted(list(registered_cameras.keys()))
-        n_cams = len(cam_ids)
-        if n_cams < 2:
+        cam_ids = sorted(registered_cameras.keys())
+        if len(cam_ids) < 2:
             print("Global BA skipped: Less than 2 cameras registered.")
             return registered_cameras, track_graph
 
-        cam_id_to_idx = {cid: idx for idx, cid in enumerate(cam_ids)}
-
-        # 1. Collect all valid observations directly from TrackGraph & all_kp
-        obs_cam_ids = []
-        obs_p3d_ids = []
-        obs_uvs = []
-        global_p3d_ids = set()
-
-        for (cam_id, kp_idx), p3d_id in track_graph.kp_to_point3D.items():
-            if cam_id in cam_id_to_idx and p3d_id in track_graph.global_points3D:
-                uv = all_kp[cam_id][kp_idx].pt  # Extract (u, v) pixel coordinate
-                obs_cam_ids.append(cam_id)
-                obs_p3d_ids.append(p3d_id)
-                obs_uvs.append(uv)
-                global_p3d_ids.add(p3d_id)
-
-        p3d_id_list = sorted(list(global_p3d_ids))
-        p3d_id_to_idx = {pid: idx for idx, pid in enumerate(p3d_id_list)}
-        n_points = len(p3d_id_list)
-
-        if len(obs_uvs) == 0:
-            print("Global BA skipped: No active observations found.")
-            return registered_cameras, track_graph
-
-        # 2. Extract initial 3D point positions and camera parameters
-        pts3D_init = np.array([track_graph.global_points3D[pid] for pid in p3d_id_list])
-        
-        cam_rvecs_init, cam_Ts_init = [], []
-        for cid in cam_ids:
-            R = registered_cameras[cid]["R"]
-            T = registered_cameras[cid]["T"]
-            rvec, _ = cv2.Rodrigues(R)
-            cam_rvecs_init.append(rvec.flatten())
-            cam_Ts_init.append(T.flatten())
-
-        # 3. Create GPU Tensors with gradients enabled
-        pts3D_t = torch.tensor(pts3D_init, dtype=torch.float32, device=self.device, requires_grad=True)
-        rvecs_t = torch.tensor(np.array(cam_rvecs_init), dtype=torch.float32, device=self.device, requires_grad=True)
-        Ts_t = torch.tensor(np.array(cam_Ts_init), dtype=torch.float32, device=self.device, requires_grad=True)
-
-        # Observation index tensors
-        obs_c_idx = torch.tensor([cam_id_to_idx[cid] for cid in obs_cam_ids], dtype=torch.long, device=self.device)
-        obs_p_idx = torch.tensor([p3d_id_to_idx[pid] for pid in obs_p3d_ids], dtype=torch.long, device=self.device)
-        obs_uv_t = torch.tensor(np.array(obs_uvs), dtype=torch.float32, device=self.device)
-
-        # Anchor gauge freedom: Keep Camera 0 (or Sub-Model 1's origin) fixed
-        fixed_cam_idx = 0
-
-        # 4. Initialize PyTorch GPU L-BFGS Optimizer
-        optimizer = torch.optim.LBFGS([pts3D_t, rvecs_t, Ts_t], max_iter=max_iter, line_search_fn="strong_wolfe")
-
-        print(f"Running Global GPU BA on {n_cams} Cameras | {n_points} Points | {len(obs_uvs)} Observations...")
+        if fixed_cam_id is None:
+            fixed_cam_id = cam_ids[0]
+        self._run_ba(registered_cameras, track_graph, all_kp, cam_ids, {fixed_cam_id},
+                     max_iter, loss_scale, label="Global BA")
+        return registered_cameras, track_graph

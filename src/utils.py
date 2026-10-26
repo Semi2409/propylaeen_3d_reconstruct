@@ -424,8 +424,29 @@ def align_and_merge(master_cams, master_tck,sub_cams, sub_track, ref_cams):
             sub_cams[idx] = {"R": R_mast, "T": T_mast}
             master_cameras[idx] = {"R": R_mast, "T": T_mast}
 
-    # 4. Merge 3D points into master_track
+    # 4. Merge 3D points AND their observations into master_track.
+    # Each sub-model's TrackGraph numbers its points from 0, so sub-model IDs collide with
+    # master IDs. Every sub point therefore gets a fresh master ID, unless one of its
+    # keypoints is already a master observation; then it is the same physical point
+    # and its observations are fused into that existing master point.
+    sub_observations = {}
+    for obs, p3d_id in sub_track.kp_to_point3D.items():
+        sub_observations.setdefault(p3d_id, []).append(obs)
+
+    n_new, n_fused = 0, 0
     for p3d_id, pt3d in sub_track.global_points3D.items():
-        if p3d_id not in master_track.global_points3D:
-            master_track.global_points3D[p3d_id] = pt3d
+        observations = sub_observations.get(p3d_id, [])
+        existing_ids = [master_track.kp_to_point3D[o] for o in observations if o in master_track.kp_to_point3D]
+
+        if existing_ids:
+            target_id = existing_ids[0]
+            for obs in observations:
+                if obs not in master_track.kp_to_point3D:
+                    master_track.link_keypoint_to_track(obs[0], obs[1], target_id)
+            n_fused += 1
+        else:
+            master_track.add_point3D(pt3d, observations)
+            n_new += 1
+
+    print(f"  -> Merged sub-model points: {n_new} new, {n_fused} fused with existing master points")
     return master_cameras, master_track
