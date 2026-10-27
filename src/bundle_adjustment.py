@@ -2,8 +2,8 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from scipy.optimize import least_squares
-from scipy.sparse import lil_matrix
+
+from triangulation import Triangulator
 
 class BundleAdjuster:
     def __init__(self, K: np.ndarray, device="cuda"):
@@ -14,8 +14,8 @@ class BundleAdjuster:
 
     def compute_reprojection_residuals(self, params: np.ndarray, n_points: int, pts1_2d: np.ndarray, pts2_2d: np.ndarray,) -> np.ndarray:
         """
-        CPU-based residual computation strictly maintained so your main.py 
-        can calculate and print the 'Initial Reprojection RMSE' before optimization.
+        CPU residuals of the two-view problem (camera 1 = [I | 0], camera 2 = (R, T)),
+        used to report the reprojection RMSE before optimization.
         """
         rvec = params[0:3]
         T = params[3:6].reshape(3, 1)
@@ -158,8 +158,8 @@ class BundleAdjuster:
 
     def optimize_2view(self, pts3D_init: np.ndarray, R_init: np.ndarray, T_init: np.ndarray, pts1_2d: np.ndarray, pts2_2d: np.ndarray, max_iter: int = 100):
         """
-        Executes non-linear optimization natively on the GPU using PyTorch Autograd.
-        Replaces scipy.optimize.least_squares.
+        Two-view bundle adjustment of the seed pair on the GPU (PyTorch autograd + L-BFGS):
+        camera 1 stays at [I | 0], camera 2 and all points are optimized.
         """
         # 1. Convert NumPy arrays to GPU Tensors and enable gradient tracking
         pts3D = torch.tensor(pts3D_init, dtype=torch.float32, device=self.device, requires_grad=True)
@@ -182,16 +182,7 @@ class BundleAdjuster:
             proj1 = proj1[:, :2] / proj1[:, 2:]
             
             # Camera 2 Reprojection (GPU Rodrigues Conversion)
-            theta = torch.norm(rvec)
-            if theta > 1e-6:
-                r = rvec / theta
-                K_mat = torch.zeros((3, 3), device=self.device)
-                K_mat[0, 1] = -r[2]; K_mat[0, 2] = r[1]
-                K_mat[1, 0] = r[2];  K_mat[1, 2] = -r[0]
-                K_mat[2, 0] = -r[1]; K_mat[2, 1] = r[0]
-                R = torch.eye(3, device=self.device) + torch.sin(theta)*K_mat + (1-torch.cos(theta))*(K_mat@K_mat)
-            else:
-                R = torch.eye(3, device=self.device)
+            R = self._rodrigues_batch(rvec[None])[0]
 
             pts3D_cam2 = (R @ pts3D.T).T + T
             proj2 = pts3D_cam2 @ self.K.T
@@ -211,16 +202,7 @@ class BundleAdjuster:
             proj1 = pts3D @ self.K.T
             proj1 = proj1[:, :2] / proj1[:, 2:]
             
-            theta = torch.norm(rvec)
-            if theta > 1e-6:
-                r = rvec / theta
-                K_mat = torch.zeros((3, 3), device=self.device)
-                K_mat[0, 1] = -r[2]; K_mat[0, 2] = r[1]
-                K_mat[1, 0] = r[2];  K_mat[1, 2] = -r[0]
-                K_mat[2, 0] = -r[1]; K_mat[2, 1] = r[0]
-                R_opt = torch.eye(3, device=self.device) + torch.sin(theta)*K_mat + (1-torch.cos(theta))*(K_mat@K_mat)
-            else:
-                R_opt = torch.eye(3, device=self.device)
+            R_opt = self._rodrigues_batch(rvec[None])[0]
 
             pts3D_cam2 = (R_opt @ pts3D.T).T + T.view(3, 1).T
             proj2 = pts3D_cam2 @ self.K.T
@@ -240,6 +222,7 @@ class BundleAdjuster:
         max_iter: int = 200,
         loss_scale: float = 1.0,
         fixed_cam_id=None,
+        outlier_thresholds_px=None,
     ) -> tuple[dict, object]:
         """
         Executes Global Bundle Adjustment using PyTorch autograd + L-BFGS.
@@ -249,6 +232,9 @@ class BundleAdjuster:
             loss_scale (float): Huber threshold in pixels. Residuals larger than this are
                                 down-weighted (linear instead of quadratic), which limits outlier impact.
             fixed_cam_id: Camera held fixed to anchor the gauge (default: lowest camera id).
+            outlier_thresholds_px: Optional list, e.g. [20, 4]. Runs one round per value:
+                                   filter_reprojection_outliers(value) followed by a BA.
+                                   None = a single BA without filtering.
         """
         cam_ids = sorted(registered_cameras.keys())
         if len(cam_ids) < 2:
@@ -257,6 +243,35 @@ class BundleAdjuster:
 
         if fixed_cam_id is None:
             fixed_cam_id = cam_ids[0]
-        self._run_ba(registered_cameras, track_graph, all_kp, cam_ids, {fixed_cam_id},
-                     max_iter, loss_scale, label="Global BA")
+        for max_err_px in (outlier_thresholds_px or [None]):
+            if max_err_px is not None:
+                self.filter_reprojection_outliers(registered_cameras, track_graph, all_kp, max_err_px)
+            self._run_ba(registered_cameras, track_graph, all_kp, cam_ids, {fixed_cam_id},
+                         max_iter, loss_scale, label="Global BA")
         return registered_cameras, track_graph
+
+    def filter_reprojection_outliers(self, registered_cameras: dict, track_graph, all_kp: dict, max_err_px: float):
+        """
+        Removes observations with reprojection error > max_err_px or behind the camera,
+        plus observations of unregistered cameras / deleted points. Then drops 3D points
+        left with fewer than 2 observations. Edits track_graph in place.
+        """
+        obs, err, depth = Triangulator(self.K_np).track_reprojection_errors(registered_cameras, track_graph, all_kp)
+        n_dangling = len(track_graph.kp_to_point3D) - len(obs)
+        if not obs:
+            return
+        good = (depth > 1e-6) & (err <= max_err_px)
+
+        kept = {o: p for (o, p), g in zip(obs, good) if g}
+        obs_count = {}
+        for p in kept.values():
+            obs_count[p] = obs_count.get(p, 0) + 1
+
+        n_pts_before = len(track_graph.global_points3D)
+        track_graph.kp_to_point3D = {o: p for o, p in kept.items() if obs_count[p] >= 2}
+        track_graph.global_points3D = {p: x for p, x in track_graph.global_points3D.items()
+                                       if obs_count.get(p, 0) >= 2}
+
+        print(f"Outlier filter (> {max_err_px:.1f} px): removed {int((~good).sum()) + n_dangling} obs, "
+              f"{n_pts_before - len(track_graph.global_points3D)} pts -> "
+              f"{len(track_graph.global_points3D)} pts | {len(track_graph.kp_to_point3D)} obs remain")

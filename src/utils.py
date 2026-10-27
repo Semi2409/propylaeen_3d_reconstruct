@@ -1,7 +1,11 @@
 import os
+import copy
+import itertools
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
+
+from triangulation import Triangulator, camera_center
 
 
 def export_ply(filename: str, pts3D: np.ndarray, colors: np.ndarray = None) -> None:
@@ -168,155 +172,136 @@ def initialize_seed_submodel(seed_pair, estimator, triangulator, optimizer, all_
 
 
 def register_submodel_cameras(registered_cameras: dict, track_graph, image_indices: list[int], all_kp: dict, all_des: dict, match_graph: dict, K: np.ndarray, estimator, triangulator, optimizer,
-    max_passes: int = 3, max_height_m: float = 1.5, max_step_m: float = 10.0, min_baseline_m: float = 0.05
+    max_passes: int = 3, max_reproj_px: float = 4.0, min_angle_deg: float = 1.5,
+    max_depth_factor: float = 10.0, max_step_factor: float = 10.0, min_inliers: int = 15
 ):
     """
-    Runs multi-pass incremental PnP registration, DLT triangulation, and sliding window 
+    Runs multi-pass incremental PnP registration, DLT triangulation, and sliding window
     Local BA over a target list of image indices for a sub-model.
+
+    All guardrails are scale free:
+        max_reproj_px    : reprojection error in pixels (PnP RANSAC + new points + track linking)
+        min_angle_deg    : minimum triangulation angle between the two viewing rays
+        max_depth_factor : new points deeper than this * median depth of the pair are dropped
+        max_step_factor  : a new camera must lie within this * median camera spacing
+                           of its nearest registered camera (catches wild PnP poses)
     """
     unregistered = set(image_indices) - set(registered_cameras.keys())
-    
+
+    def match_kp_indices(curr_idx, reg_idx, m):
+        """(kp index in curr image, kp index in reg image) of a match; match_graph keys are (low, high)."""
+        return (m.queryIdx, m.trainIdx) if curr_idx < reg_idx else (m.trainIdx, m.queryIdx)
+
     for pass_num in range(max_passes):
         registered_this_pass = 0
-        
+
         # Process unregistered pool for this sub-model
         for curr_idx in sorted(list(unregistered)):
-            if curr_idx in registered_cameras:
-                continue
-                
             kp_curr = all_kp[curr_idx]
-            
-            # 1. Gather 2D-to-3D correspondences from currently registered cameras via TrackGraph
-            pts2D = []
-            pts3D = []
-            p3d_ids_used = []
 
-            for reg_idx in list(registered_cameras.keys()):
+            # 1. Gather 2D-to-3D correspondences from currently registered cameras via TrackGraph.
+            # No 3D filter needed here: map points were validated when they were triangulated,
+            # remaining outliers are rejected by RANSAC.
+            pts2D, pts3D, p3d_ids_used, seen = [], [], [], set()
+            for reg_idx in registered_cameras:
                 pair = (min(curr_idx, reg_idx), max(curr_idx, reg_idx))
-                if pair in match_graph:
-                    matches = match_graph[pair]
-                    for m in matches:
-                        kp_reg_idx = m.trainIdx if curr_idx < reg_idx else m.queryIdx
-                        kp_curr_idx = m.queryIdx if curr_idx < reg_idx else m.trainIdx
-                        
-                        p3d_id = track_graph.get_point3D_id(reg_idx, kp_reg_idx)
-                        if p3d_id is not None:
-                            pts3D.append(track_graph.global_points3D[p3d_id])
-                            pts2D.append(kp_curr[kp_curr_idx].pt)
-                            p3d_ids_used.append((kp_curr_idx, p3d_id))
+                for m in match_graph.get(pair, []):
+                    kp_curr_idx, kp_reg_idx = match_kp_indices(curr_idx, reg_idx, m)
+                    p3d_id = track_graph.get_point3D_id(reg_idx, kp_reg_idx)
+                    if p3d_id is not None and (kp_curr_idx, p3d_id) not in seen:
+                        seen.add((kp_curr_idx, p3d_id))
+                        pts3D.append(track_graph.global_points3D[p3d_id])
+                        pts2D.append(kp_curr[kp_curr_idx].pt)
+                        p3d_ids_used.append((kp_curr_idx, p3d_id))
 
-            # Filter unphysical 3D map matches
-            clean_pts2D, clean_pts3D, clean_p3d_ids = [], [], []
-            for pt2d, pt3d, p3d_info in zip(pts2D, pts3D, p3d_ids_used):
-                if np.linalg.norm(pt3d) < 50.0 and 40.0 > pt3d[2] > 0.0:
-                    clean_pts2D.append(pt2d)
-                    clean_pts3D.append(pt3d)
-                    clean_p3d_ids.append(p3d_info)
-
-            pts2D, pts3D, p3d_ids_used = clean_pts2D, clean_pts3D, clean_p3d_ids
-
-            if len(pts2D) < 15:
+            if len(pts2D) < min_inliers:
                 continue
 
-            # 2. Estimate Camera Pose via PnP RANSAC
+            # 2. Estimate Camera Pose via PnP RANSAC (inlier = reprojection error <= max_reproj_px)
+            pts3D, pts2D = np.float64(pts3D), np.float64(pts2D)
             success, rvec, tvec, pnp_inliers = cv2.solvePnPRansac(
-                np.float32(pts3D), np.float32(pts2D), K, distCoeffs=None,
-                flags=cv2.SOLVEPNP_ITERATIVE, reprojectionError=5.0, confidence=0.99
+                pts3D, pts2D, K, distCoeffs=None,
+                flags=cv2.SOLVEPNP_ITERATIVE, reprojectionError=max_reproj_px, confidence=0.99
             )
-
-            if not success or pnp_inliers is None or len(pnp_inliers) < 15:
+            if not success or pnp_inliers is None or len(pnp_inliers) < min_inliers:
                 continue
 
             R_curr, _ = cv2.Rodrigues(rvec)
             T_curr = tvec.reshape(3, 1)
-            C_curr = (-R_curr.T @ T_curr).flatten()
-                    
-            # Height Guardrail (Z height relative to local seed origin)
-            if abs(C_curr[1]) > max_height_m:
+            C_curr = camera_center(R_curr, T_curr)
+            inl = pnp_inliers.flatten()
+
+            # Cheirality of the pose: the inlier points must lie in front of the new camera.
+            # A point behind the camera can still project into the image (mirrored), so RANSAC alone misses it.
+            if np.mean(triangulator.point_depths(pts3D[inl], R_curr, T_curr) > 0) < 0.9:
                 continue
 
-            # Motion Jump Guardrail (relative to last registered camera in this sub-model)
-            if registered_cameras:
-                last_reg_id = list(registered_cameras.keys())[-1]
-                R_last = registered_cameras[last_reg_id]["R"]
-                T_last = registered_cameras[last_reg_id]["T"]
-                C_last = (-R_last.T @ T_last).flatten()
-                
-                step_distance = np.linalg.norm(C_curr - C_last)
-                if step_distance > max_step_m:
+            # Motion jump guardrail, relative to the typical camera spacing of this sub-model
+            C_reg = camera_centers(registered_cameras, list(registered_cameras))
+            if len(C_reg) >= 3:
+                pairwise = np.linalg.norm(C_reg[:, None] - C_reg[None], axis=2)
+                np.fill_diagonal(pairwise, np.inf)
+                typical_spacing = np.median(pairwise.min(axis=1))
+                if np.linalg.norm(C_reg - C_curr, axis=1).min() > max_step_factor * typical_spacing:
                     continue
 
             # Pose accepted! Register camera & link PnP inliers to TrackGraph
             registered_cameras[curr_idx] = {"R": R_curr, "T": T_curr}
             unregistered.remove(curr_idx)
             registered_this_pass += 1
-            
-            for idx in pnp_inliers.flatten():
+
+            for idx in inl:
                 kp_curr_idx, p3d_id = p3d_ids_used[idx]
-                track_graph.link_keypoint_to_track(curr_idx, kp_curr_idx, p3d_id)
+                if track_graph.get_point3D_id(curr_idx, kp_curr_idx) is None:
+                    track_graph.link_keypoint_to_track(curr_idx, kp_curr_idx, p3d_id)
 
             # 3. DLT Triangulation to Expand Map
-            P_curr = K @ np.hstack((R_curr, T_curr))
-            
-            for reg_idx in list(registered_cameras.keys()):
-                if reg_idx == curr_idx:
-                    continue
+            P_curr = triangulator.projection_matrix(R_curr, T_curr)
 
+            for reg_idx in list(registered_cameras.keys()):
                 pair = (min(curr_idx, reg_idx), max(curr_idx, reg_idx))
-                if pair not in match_graph:
+                if reg_idx == curr_idx or pair not in match_graph:
                     continue
 
                 matches = match_graph[pair]
                 R_prev = registered_cameras[reg_idx]["R"]
                 T_prev = registered_cameras[reg_idx]["T"]
-                P_prev = K @ np.hstack((R_prev, T_prev))
-                C_prev = (-R_prev.T @ T_prev).flatten()
-                
-                # Pairwise baseline guardrail
-                if np.linalg.norm(C_curr - C_prev) < min_baseline_m:
-                    continue
+                P_prev = triangulator.projection_matrix(R_prev, T_prev)
 
                 # Extract matching 2D coordinates
                 if curr_idx < reg_idx:
-                    pts_curr, pts_prev = estimator.extract_match_coordinates(
-                        all_kp[curr_idx], all_kp[reg_idx], matches
-                    )
+                    pts_curr, pts_prev = estimator.extract_match_coordinates(all_kp[curr_idx], all_kp[reg_idx], matches)
                 else:
-                    pts_prev, pts_curr = estimator.extract_match_coordinates(
-                        all_kp[reg_idx], all_kp[curr_idx], matches
-                    )
+                    pts_prev, pts_curr = estimator.extract_match_coordinates(all_kp[reg_idx], all_kp[curr_idx], matches)
 
                 raw_pts3D = triangulator.triangulate_points(P_prev, P_curr, pts_prev, pts_curr)
-                valid_pts3D, v_mask = triangulator.filter_cheirality(raw_pts3D, R_curr, T_curr)
-                T_curr_col = T_curr.reshape(3, 1)
+                valid = triangulator.filter_triangulated_points(
+                    raw_pts3D, R_prev, T_prev, pts_prev, R_curr, T_curr, pts_curr,
+                    max_reproj_px=max_reproj_px, min_angle_deg=min_angle_deg, max_depth_factor=max_depth_factor,
+                )
 
-                valid_counter = 0
-                for idx_in_pair, is_valid in enumerate(v_mask):
-                    if not is_valid:
-                        continue
-                        
-                    p3d_val = valid_pts3D[valid_counter]
-                    valid_counter += 1
+                for i, m in enumerate(matches):
+                    kp_curr_i, kp_reg_i = match_kp_indices(curr_idx, reg_idx, m)
+                    id_reg = track_graph.get_point3D_id(reg_idx, kp_reg_i)
+                    id_curr = track_graph.get_point3D_id(curr_idx, kp_curr_i)
 
-                    # Depth filtering in current camera coordinate space
-                    pt3d_cam = R_curr @ p3d_val.reshape(3, 1) + T_curr_col
-                    z_depth = pt3d_cam[2, 0]
-
-                    if not (0.2 < z_depth < 40.0 and np.linalg.norm(p3d_val) < 50.0):
-                        continue
-
-                    m = matches[idx_in_pair]
-                    kp_curr_i = m.queryIdx if curr_idx < reg_idx else m.trainIdx
-                    kp_reg_i  = m.trainIdx if curr_idx < reg_idx else m.queryIdx
-
-                    existing_id = track_graph.get_point3D_id(reg_idx, kp_reg_i)
-                    if existing_id is not None:
-                        track_graph.link_keypoint_to_track(curr_idx, kp_curr_i, existing_id)
-                    else:
-                        track_graph.add_point3D(
-                            p3d_val, 
-                            observations=[(reg_idx, kp_reg_i), (curr_idx, kp_curr_i)]
-                        )
+                    if id_reg is None and id_curr is None:
+                        # Brand-new point: must pass all scale-free checks
+                        if valid[i]:
+                            track_graph.add_point3D(raw_pts3D[i], observations=[(reg_idx, kp_reg_i), (curr_idx, kp_curr_i)])
+                    elif id_curr is None:
+                        # Extend an existing track to the new image, if the existing point reprojects there
+                        X = np.asarray(track_graph.global_points3D[id_reg]).reshape(1, 3)
+                        if (triangulator.point_depths(X, R_curr, T_curr)[0] > 0 and
+                                triangulator.reprojection_errors(X, R_curr, T_curr, pts_curr[i:i + 1])[0] <= max_reproj_px):
+                            track_graph.link_keypoint_to_track(curr_idx, kp_curr_i, id_reg)
+                    elif id_reg is None:
+                        # Extend the new image's track back to the registered image
+                        X = np.asarray(track_graph.global_points3D[id_curr]).reshape(1, 3)
+                        if (triangulator.point_depths(X, R_prev, T_prev)[0] > 0 and
+                                triangulator.reprojection_errors(X, R_prev, T_prev, pts_prev[i:i + 1])[0] <= max_reproj_px):
+                            track_graph.link_keypoint_to_track(reg_idx, kp_reg_i, id_curr)
+                    # Both keypoints already belong to tracks: leave them as they are
 
             # 4. Sliding Window Local Bundle Adjustment
             optimizer.optimize_local_window(
@@ -386,21 +371,115 @@ def umeyama_sim3(source_pts: np.ndarray, target_pts: np.ndarray) -> tuple[float,
 
 
 
-# Helper function to align and merge a sub-model into the Master Model
-def align_and_merge(master_cams, master_tck,sub_cams, sub_track, ref_cams):
+def camera_centers(cams: dict, ids) -> np.ndarray:
+    """(N, 3) optical centers of the cameras `ids` in a {id: {"R", "T"}} dict."""
+    return np.array([camera_center(cams[i]["R"], cams[i]["T"]) for i in ids], dtype=np.float64).reshape(-1, 3)
 
+
+def ransac_umeyama_sim3(source_pts: np.ndarray, target_pts: np.ndarray, inlier_frac: float = 0.03,
+                        n_samples: int = 500, seed: int = 0):
+    """
+    Robust umeyama_sim3: RANSAC over minimal 3-point fits, then a final fit on all inliers.
+    Inlier threshold = inlier_frac * median distance of the target points to their centroid.
+
+    Returns:
+        (scale, R, t), inlier mask (N,)
+    """
+    n = len(source_pts)
+    thr = inlier_frac * np.median(np.linalg.norm(target_pts - target_pts.mean(axis=0), axis=1))
+
+    def errors(idx):
+        s, R, t = umeyama_sim3(source_pts[idx], target_pts[idx])
+        return np.linalg.norm((s * (R @ source_pts.T)).T + t - target_pts, axis=1)
+
+    if n * (n - 1) * (n - 2) // 6 <= n_samples:
+        samples = list(itertools.combinations(range(n), 3))
+    else:
+        rng = np.random.default_rng(seed)
+        samples = [rng.choice(n, 3, replace=False) for _ in range(n_samples)]
+
+    best, best_count = np.ones(n, dtype=bool), -1
+    for idx in samples:
+        inl = errors(list(idx)) <= thr
+        if inl.sum() > best_count:
+            best, best_count = inl, inl.sum()
+    if best.sum() < 3:
+        best[:] = True
+
+    # Refine: refit on inliers and re-select inliers once
+    best = errors(np.where(best)[0]) <= thr
+    if best.sum() < 3:
+        best[:] = True
+    return umeyama_sim3(source_pts[best], target_pts[best]), best
+
+
+def find_shared_points3D(master_track, sub_track) -> tuple[np.ndarray, np.ndarray]:
+    """3D-3D correspondences: sub-model points with a keypoint that is already a master observation."""
+    pairs = {}
+    for obs, p_sub in sub_track.kp_to_point3D.items():
+        p_mst = master_track.kp_to_point3D.get(obs)
+        if p_mst is not None and p_sub in sub_track.global_points3D and p_mst in master_track.global_points3D:
+            pairs.setdefault(p_sub, p_mst)
+    src = np.array([np.asarray(sub_track.global_points3D[p]).ravel() for p in pairs], dtype=np.float64)
+    tgt = np.array([np.asarray(master_track.global_points3D[p]).ravel() for p in pairs.values()], dtype=np.float64)
+    return src.reshape(-1, 3), tgt.reshape(-1, 3)
+
+
+def solve_submodel_sim3(master_cams, master_track, sub_cams, sub_track, min_points: int = 50, min_cams: int = 3,
+                        stats: dict = None):
+    """
+    Sim(3) that maps the sub-model into master space (Target = s * R * Source + t).
+    Prefers the shared 3D points (thousands of correspondences, well conditioned); falls back to
+    the shared camera centers, which are often nearly collinear and leave the rotation weakly
+    constrained. Returns None if there is not enough overlap.
+    If a `stats` dict is passed, the alignment numbers are written into it (for analysis).
+    """
+    stats = {} if stats is None else stats
+    shared_ids = sorted(set(master_cams) & set(sub_cams))
+    src_pts, tgt_pts = find_shared_points3D(master_track, sub_track)
+    stats.update(shared_cameras=len(shared_ids), shared_points=len(src_pts))
+
+    if len(src_pts) >= min_points:
+        sim3, inl = ransac_umeyama_sim3(src_pts, tgt_pts, inlier_frac=0.03)
+        stats.update(method="3D points", inliers=int(inl.sum()), candidates=len(inl))
+        print(f"  -> Umeyama on shared 3D points: {int(inl.sum())}/{len(inl)} inliers")
+    elif len(shared_ids) >= min_cams:
+        sim3, inl = ransac_umeyama_sim3(camera_centers(sub_cams, shared_ids),
+                                        camera_centers(master_cams, shared_ids), inlier_frac=0.05)
+        stats.update(method="camera centers", inliers=int(inl.sum()), candidates=len(inl))
+        print(f"  -> Umeyama on shared camera centers {shared_ids}: {int(inl.sum())}/{len(inl)} inliers")
+    else:
+        return None
+
+    # Sanity check: how well do the shared camera centers agree after the transform?
+    if shared_ids:
+        s, R, t = sim3
+        err = np.linalg.norm((s * (R @ camera_centers(sub_cams, shared_ids).T)).T + t
+                             - camera_centers(master_cams, shared_ids), axis=1)
+        stats.update(cam_err_median=float(np.median(err)), cam_err_max=float(err.max()))
+        print(f"  -> {len(shared_ids)} shared cameras, center error after alignment: "
+              f"median {np.median(err):.4f}, max {err.max():.4f}")
+    stats.update(scale=float(sim3[0]))
+    return sim3
+
+
+# Helper function to align and merge a sub-model into the Master Model
+def align_and_merge(master_cams, master_tck, sub_cams, sub_track, stats: dict = None):
+    """
+    Aligns a sub-model onto the master model via a robust Umeyama Sim(3) (solve_submodel_sim3)
+    and merges its cameras + 3D points. Edits sub_cams / sub_track / master_tck in place.
+    Returns (master_cameras, master_track), or None if the overlap is too small to align.
+    If a `stats` dict is passed, alignment and merge numbers are written into it (for analysis).
+    """
+    stats = {} if stats is None else stats
     master_cameras = {**master_cams}
     master_track = master_tck
-    # Find shared camera indices between the sub-model and reference cameras
-    shared_ids = list(set(ref_cams.keys()) & set(sub_cams.keys()))
-    print(f"Shared corner cameras for alignment: {shared_ids}")
-    
-    # Extract physical optical centers: C = -R^T @ T
-    pts_source = np.array([(-sub_cams[idx]["R"].T @ sub_cams[idx]["T"]).flatten() for idx in shared_ids])
-    pts_target = np.array([(-ref_cams[idx]["R"].T @ ref_cams[idx]["T"]).flatten() for idx in shared_ids])
 
     # 1. Compute Sim(3) parameters (Scale, Rotation, Translation)
-    scale, R_sim, t_sim = umeyama_sim3(pts_source, pts_target)
+    sim3 = solve_submodel_sim3(master_cameras, master_track, sub_cams, sub_track, stats=stats)
+    if sim3 is None:
+        return None
+    scale, R_sim, t_sim = sim3
     print(f"  -> Solved Sim(3): Scale = {scale:.4f}, Translation = {t_sim.round(2)}")
 
     # 2. Transform sub-model 3D points into Master space
@@ -415,7 +494,7 @@ def align_and_merge(master_cams, master_tck,sub_cams, sub_track, ref_cams):
     for idx, pose in sub_cams.items():
         if idx not in master_cameras:
             R_loc, T_loc = pose["R"], pose["T"]
-            C_loc = (-R_loc.T @ T_loc).flatten()
+            C_loc = camera_center(R_loc, T_loc)
             
             C_mast = scale * (R_sim @ C_loc) + t_sim
             R_mast = R_loc @ R_sim.T
@@ -448,5 +527,144 @@ def align_and_merge(master_cams, master_tck,sub_cams, sub_track, ref_cams):
             master_track.add_point3D(pt3d, observations)
             n_new += 1
 
+    stats.update(new_points=n_new, fused_points=n_fused)
     print(f"  -> Merged sub-model points: {n_new} new, {n_fused} fused with existing master points")
     return master_cameras, master_track
+
+
+def merge_submodels(submodels: dict, reference: str, stats: list = None):
+    """
+    Merges named sub-models {name: (cameras, track_graph)} into one master model,
+    in the coordinate frame of `reference`. Greedy: always merges the sub-model with
+    the most overlap (shared cameras, shared observations) with the current master next.
+    Works on deep copies, the passed sub-models stay untouched.
+    If a `stats` list is passed, one dict per merge step is appended (merge order, alignment numbers).
+
+    Returns:
+        master_cameras, master_track, cam_source ({cam_id: name of the sub-model it came from})
+    """
+    remaining = {name: copy.deepcopy(model) for name, model in submodels.items()}
+    master_cameras, master_track = remaining.pop(reference)
+    cam_source = {cid: reference for cid in master_cameras}
+
+    def overlap(name):
+        cams, track = remaining[name]
+        return (len(set(cams) & set(master_cameras)),
+                sum(o in master_track.kp_to_point3D for o in track.kp_to_point3D))
+
+    while remaining:
+        name = max(remaining, key=overlap)
+        sub_cams, sub_track = remaining.pop(name)
+        print(f"\nMerging '{name}' sub-model ({len(sub_cams)} cams, {len(sub_track.global_points3D)} pts)")
+
+        new_cam_ids = set(sub_cams) - set(master_cameras)
+        step = {"name": name, "cameras": len(sub_cams), "points": len(sub_track.global_points3D),
+                "new_cameras": len(new_cam_ids)}
+        merged = align_and_merge(master_cameras, master_track, sub_cams, sub_track, stats=step)
+        if stats is not None:
+            stats.append(step)
+        if merged is None:
+            print(f"  -> Not enough overlap with the master model. Could not merge: {[name, *remaining]}")
+            break
+        master_cameras, master_track = merged
+        cam_source.update({cid: name for cid in new_cam_ids})
+
+    print(f"\nMaster model: {len(master_cameras)} cameras | {len(master_track.global_points3D)} 3D points | "
+          f"{len(master_track.kp_to_point3D)} observations")
+    return master_cameras, master_track, cam_source
+
+
+def sample_point_colors(track_graph, all_kp: dict, dataset) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Returns the (N, 3) points of the track graph and their (N, 3) uint8 RGB colors,
+    sampled at the keypoint of the first image that observes each point.
+    """
+    point_ids = list(track_graph.global_points3D.keys())
+    points = np.array([np.asarray(track_graph.global_points3D[p]).ravel() for p in point_ids]).reshape(-1, 3)
+
+    first_obs = {}
+    for (cam_id, kp_idx), p3d_id in track_graph.kp_to_point3D.items():
+        if p3d_id in track_graph.global_points3D:
+            first_obs.setdefault(p3d_id, (cam_id, kp_idx))
+
+    rows_by_cam = {}
+    for row, p3d_id in enumerate(point_ids):
+        if p3d_id in first_obs:
+            cam_id, kp_idx = first_obs[p3d_id]
+            rows_by_cam.setdefault(cam_id, []).append((row, kp_idx))
+
+    colors = np.zeros((len(point_ids), 3), dtype=np.uint8)
+    for cam_id, rows in rows_by_cam.items():   # load each image only once
+        img = dataset[cam_id]
+        h, w = img.shape[:2]
+        for row, kp_idx in rows:
+            u, v = all_kp[cam_id][kp_idx].pt
+            b, g, r = img[min(int(round(v)), h - 1), min(int(round(u)), w - 1)]
+            colors[row] = (r, g, b)
+    return points, colors
+
+
+def point_viewing_centers(track_graph, cameras: dict) -> np.ndarray:
+    """
+    (N, 3) mean optical center of the cameras observing each point, in the same order as
+    sample_point_colors / track_graph.global_points3D. Used to orient surface normals
+    towards the side the point was seen from.
+    """
+    sums, counts = {}, {}
+    for (cam_id, _), p3d_id in track_graph.kp_to_point3D.items():
+        if cam_id in cameras and p3d_id in track_graph.global_points3D:
+            C = camera_center(cameras[cam_id]["R"], cameras[cam_id]["T"])
+            sums[p3d_id] = sums.get(p3d_id, 0) + C
+            counts[p3d_id] = counts.get(p3d_id, 0) + 1
+    fallback = camera_centers(cameras, list(cameras)).mean(axis=0)
+    return np.array([sums[p] / counts[p] if p in counts else fallback
+                     for p in track_graph.global_points3D]).reshape(-1, 3)
+
+
+def point_quality(track_graph, cameras: dict, all_kp: dict, triangulator) -> dict:
+    """
+    Per-point quality measures, in the same order as sample_point_colors / track_graph.global_points3D:
+        track_length : number of registered images observing the point
+        max_angle    : largest triangulation angle (deg) between any two of its viewing rays
+        reproj_err   : mean reprojection error (px) over its observations
+
+    Why these matter: a point seen in only 2 views has no redundancy, an error along the epipolar
+    line moves it in depth undetected. A 3rd view verifies it, and more views average the noise.
+    """
+    point_ids = list(track_graph.global_points3D.keys())
+    row = {p: i for i, p in enumerate(point_ids)}
+    X = np.array([np.asarray(track_graph.global_points3D[p]).ravel() for p in point_ids]).reshape(-1, 3)
+
+    n = len(point_ids)
+    obs, errors, _ = triangulator.track_reprojection_errors(cameras, track_graph, all_kp)
+    rows = np.array([row[p] for _, p in obs], dtype=int)
+    # bincount sums repeated rows correctly (a point can be linked to 2 keypoints of the same image)
+    track_length = np.bincount(rows, minlength=n)
+    err_sum = np.bincount(rows, weights=errors, minlength=n)
+
+    centers = {c: camera_center(v["R"], v["T"]) for c, v in cameras.items()}
+    d = X[rows] - np.array([centers[c] for (c, _), _ in obs]).reshape(-1, 3)
+    d /= np.linalg.norm(d, axis=1, keepdims=True)
+    rays = [[] for _ in range(n)]
+    for r, ray in zip(rows, d):
+        rays[r].append(ray)
+
+    max_angle = np.zeros(n)
+    for i, r in enumerate(rays):
+        if len(r) >= 2:
+            r = np.array(r)
+            max_angle[i] = np.degrees(np.arccos(np.clip((r @ r.T).min(), -1.0, 1.0)))
+
+    reproj_err = np.where(track_length > 0, err_sum / np.maximum(track_length, 1), np.inf)
+    return {"track_length": track_length, "max_angle": max_angle, "reproj_err": reproj_err}
+
+
+def point_quality_mask(quality: dict, min_track_length: int = 3, min_angle_deg: float = 5.0,
+                       max_reproj_px: float = 2.0) -> np.ndarray:
+    """Boolean mask of points that pass all three quality thresholds (see point_quality)."""
+    mask = ((quality["track_length"] >= min_track_length) & (quality["max_angle"] >= min_angle_deg)
+            & (quality["reproj_err"] <= max_reproj_px))
+    print(f"Point quality filter (track >= {min_track_length}, angle >= {min_angle_deg} deg, "
+          f"reproj <= {max_reproj_px} px): keeps {mask.sum()} / {len(mask)} points ({mask.mean():.0%}) | "
+          f"seen in only 2 views: {np.mean(quality['track_length'] == 2):.0%}")
+    return mask

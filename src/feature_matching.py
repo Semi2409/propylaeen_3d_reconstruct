@@ -1,7 +1,5 @@
 import cv2
 import numpy as np
-from pathlib import Path
-from dataset import ImageDataset
 import torch
 from ultralytics import YOLO
 
@@ -136,27 +134,3 @@ class FeatureMatcher:
             good_matches.append(m)
 
         return good_matches
-
-    def draw_and_save_matches(self, img1, kp1, img2, kp2, matches, output_path):
-        """
-        Visualize keypoint correspondences side-by-side and save the output image.
-        
-        Parameters:
-            img1 (numpy.ndarray): First image.
-            kp1 (tuple): Keypoints of first image.
-            img2 (numpy.ndarray): Second image.
-            kp2 (tuple): Keypoints of second image.
-            matches (list): Filtered matches to draw.
-            output_path (Path or str): Path where output image should be saved.
-        """
-        match_img = cv2.drawMatches(
-            img1, kp1, img2, kp2, matches, None, 
-            flags=cv2.DrawMatchesFlags_NOT_DRAW_SINGLE_POINTS
-        )
-        
-        # Safely create the parent directories if they don't exist yet
-        out_dir = Path(output_path).parent
-        out_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save the final stitched image to disk
-        cv2.imwrite(str(output_path), match_img)  
