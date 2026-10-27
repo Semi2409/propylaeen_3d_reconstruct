@@ -1,6 +1,5 @@
 import cv2
 import numpy as np
-from dataset import ImageDataset
 
 class PoseEstimator:
     def __init__(self, K):
